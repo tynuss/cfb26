@@ -1,0 +1,48 @@
+name: Weekly model update
+
+on:
+  schedule:
+    - cron: "37 17 * * 1"   # Mondays 17:37 UTC (11:37 AM CT); GitHub may start it a little late
+  workflow_dispatch: {}      # "Run workflow" button on the Actions tab
+  push:
+    branches: [main]
+    paths: [cfb_weekly.py, page_inputs.json, .github/workflows/weekly.yml]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: weekly-model
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install packages
+        run: pip install pandas numpy scipy pyarrow pillow
+      - name: Run the model
+        run: python cfb_weekly.py out
+      - name: Check output
+        run: |
+          python - <<'PY'
+          import json
+          r = json.load(open('out/ratings.json'))['rows']; s = json.load(open('out/summary.json'))['rows']
+          assert len(r) >= 120 and len(s) >= 1, (len(r), len(s))
+          PY
+          test -s out/cfb_spread_model.html
+      - name: Publish the page
+        run: |
+          cp out/cfb_spread_model.html index.html
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git add index.html
+          if git diff --cached --quiet; then echo "No change"; exit 0; fi
+          WEEK=$(python -c "import json;print(json.load(open('out/summary.json'))['rows'][0].get('next_week') or '')")
+          git commit -m "Week ${WEEK} CFB spread model"
+          git push
