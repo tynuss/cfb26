@@ -6,7 +6,7 @@ on:
   workflow_dispatch: {}      # "Run workflow" button on the Actions tab
   push:
     branches: [main]
-    paths: [cfb_weekly.py, page_inputs.json, .github/workflows/weekly.yml]
+    paths: [page_inputs.json]   # changing the script doesn't rebuild on its own; use Run workflow
 
 permissions:
   contents: write
