@@ -396,22 +396,15 @@ def write_html(out_dir, Y):
     w = dict(W); w.update({k: float(v) for k, v in (pi.get('weights') or {}).items() if k in W and v is not None})
     adj = {str(o['team_id']): float(o['points']) for o in pi.get('overrides') or [] if o.get('points')}
     slates = sorted({(3 if str(g['season_type']).lower().startswith('post') else 2, int(g['week'])) for g in games})[:2]
-    lines = book_lines(Y, slates)
+    sp = os.path.join('lines', f'{Y}.json')
+    try: lines = json.load(open(sp))
+    except (OSError, ValueError): lines = {}
+    stamp = pd.Timestamp.now(tz='UTC').strftime('%Y-%m-%dT%H:%MZ'); fresh = book_lines(Y, slates)
+    for k, v in fresh.items(): lines[k] = dict(v, at=stamp)     # a game that has kicked off drops out of the feed and keeps its last line
+    if fresh or lines:
+        os.makedirs('lines', exist_ok=True); json.dump(lines, open(sp, 'w'), indent=0, sort_keys=True)
     if os.path.exists('lines.json'): lines.update(json.load(open('lines.json')))
     z = lambda v: 0.0 if v is None else float(v)
-    G = []
-    for g in games:
-        h, a = str(g['home_id']), str(g['away_id'])
-        m = (z(g['core']) + w['w_out']*z(g['f_out']) + w['w_to']*z(g['f_to']) + w['w_rush']*z(g['f_rush']) + w['w_react']*z(g['rx'])
-             + z(g.get('home_edge')) + adj.get(h, 0) - adj.get(a, 0))
-        b = lines.get(str(g['game_id'])) or {}; ln = b.get('line'); e = None if ln is None else m + ln; sig = ''
-        if e is not None and abs(e) >= 3:
-            pk, op = (g['h_ats1'], g['a_ats1']) if e > 0 else (g['a_ats1'], g['h_ats1'])
-            sig = 'Pass' if abs(ln) >= BIG_SPREAD else ('Strong' if max(-z(pk), z(op)) >= STRONG_RS else 'Lean')
-        G.append({'id': str(g['game_id']), 'd': g['date'], 'n': bool(g['neutral_site']), 'h': h, 'a': a, 'hn': g['home_team'], 'an': g['away_team'],
-                  'm': round(m, 2), 't': round(z(g['model_total']), 1), 'wp': int(round(100 * N.cdf(abs(m) / P['sigma']))), 'line': ln,
-                  'bt': b.get('total'), 'bk': b.get('book'), 'e': None if e is None else round(e, 2), 'sig': sig, 'ha': g['h_ats1'], 'aa': g['a_ats1'],
-                  'he': round(z(g.get('home_edge')), 2), 'tw': bool(g['this_week']), 'fb': bool(g['fbs_both']), 'adj': bool(adj.get(h) or adj.get(a))})
     try: past = rd('results.json')
     except (OSError, KeyError, ValueError): past = []
     PG = []
@@ -430,6 +423,34 @@ def write_html(out_dir, Y):
         PG.append({'id': str(g['game_id']), 'k': f"{st}-{int(g['week'])}", 'd': g['date'], 'n': bool(g['neutral_site']), 'h': h, 'a': a,
                    'hn': g['home_team'], 'an': g['away_team'], 'm': round(m, 2), 'line': ln, 'e': None if e is None else round(e, 2),
                    'sig': sig, 'r': res, 'hs': hs, 'as': aw, 'fb': bool(g['fbs_both'])})
+    done = {x['id'] for x in PG}; cur = {f"{3 if str(g['season_type']).lower().startswith('post') else 2}-{int(g['week'])}" for g in games if g['this_week']}
+    G = []
+    for x in past:                       # this week's games already played: keep them on the board with the final score
+        k = f"{3 if str(x['season_type']).lower() in ('3', 'post', 'postseason') else 2}-{int(x['week'])}"
+        if k not in cur: continue
+        h, a = str(x['home_id']), str(x['away_id']); pg = next(q for q in PG if q['id'] == str(x['game_id']))
+        b = lines.get(str(x['game_id'])) or {}; ln = b.get('line', x.get('vegas')); m = pg['m']; e = None if ln is None else m + ln; sig = ''
+        if e is not None and abs(e) >= 3:
+            pk, op = (x['h_ats1'], x['a_ats1']) if e > 0 else (x['a_ats1'], x['h_ats1'])
+            sig = 'Pass' if abs(ln) >= BIG_SPREAD else ('Strong' if max(-z(pk), z(op)) >= STRONG_RS else 'Lean')
+        G.append({'id': pg['id'], 'd': x['date'], 'n': bool(x['neutral_site']), 'h': h, 'a': a, 'hn': x['home_team'], 'an': x['away_team'],
+                  'm': m, 't': round(z(x.get('model_total')), 1), 'wp': int(round(100 * N.cdf(abs(m) / P['sigma']))), 'line': ln,
+                  'bt': b.get('total', x.get('over_under')), 'bk': b.get('book') or ('Closing line' if ln is not None else None),
+                  'e': None if e is None else round(e, 2), 'sig': sig, 'ha': x['h_ats1'], 'aa': x['a_ats1'], 'he': round(z(x.get('home_edge')), 2),
+                  'tw': True, 'fb': bool(x['fbs_both']), 'adj': False, 'fin': [x['away_score'], x['home_score']]})
+    for g in games:
+        if str(g['game_id']) in done: continue
+        h, a = str(g['home_id']), str(g['away_id'])
+        m = (z(g['core']) + w['w_out']*z(g['f_out']) + w['w_to']*z(g['f_to']) + w['w_rush']*z(g['f_rush']) + w['w_react']*z(g['rx'])
+             + z(g.get('home_edge')) + adj.get(h, 0) - adj.get(a, 0))
+        b = lines.get(str(g['game_id'])) or {}; ln = b.get('line'); e = None if ln is None else m + ln; sig = ''
+        if e is not None and abs(e) >= 3:
+            pk, op = (g['h_ats1'], g['a_ats1']) if e > 0 else (g['a_ats1'], g['h_ats1'])
+            sig = 'Pass' if abs(ln) >= BIG_SPREAD else ('Strong' if max(-z(pk), z(op)) >= STRONG_RS else 'Lean')
+        G.append({'id': str(g['game_id']), 'd': g['date'], 'n': bool(g['neutral_site']), 'h': h, 'a': a, 'hn': g['home_team'], 'an': g['away_team'],
+                  'm': round(m, 2), 't': round(z(g['model_total']), 1), 'wp': int(round(100 * N.cdf(abs(m) / P['sigma']))), 'line': ln,
+                  'bt': b.get('total'), 'bk': b.get('book'), 'e': None if e is None else round(e, 2), 'sig': sig, 'ha': g['h_ats1'], 'aa': g['a_ats1'],
+                  'he': round(z(g.get('home_edge')), 2), 'tw': bool(g['this_week']), 'fb': bool(g['fbs_both']), 'adj': bool(adj.get(h) or adj.get(a))})
     R = []
     for r in ratings:
         i = str(r['team_id'])
@@ -445,7 +466,7 @@ def write_html(out_dir, Y):
     sv = lambda df, c, i: df[c].get(i) if i in df.index and isinstance(df[c].get(i), str) else None
     teams = {i: {'s': sv(ti, 'school', i), 'a': sv(ti, 'abbreviation', i), 'c': sv(ti, 'color', i), 'i': im.get(i)} for i in ids}
     ct = lambda t: t.tz_convert(ZoneInfo('America/Chicago')).strftime('%a %b %-d, %-I:%M %p CT')
-    books = [x['bk'] for x in G if x['line'] is not None]
+    books = [x['bk'] for x in G if x['line'] is not None and not x.get('fin')]
     meta = {'season': s0.get('season'), 'week': s0.get('next_week'), 'data_through': s0.get('data_through'),
             'run_at': ct(pd.Timestamp(str(s0.get('run_at', '')).replace(' UTC', ''), tz='UTC')) if s0.get('run_at') else '',
             'lines_at': ct(pd.Timestamp.now(tz='UTC')), 'n_lines': len(books), 'book': max(set(books), key=books.count) if books else None,
@@ -583,7 +604,8 @@ function ml(g,hs,as){var ln=Math.round(Math.abs(g.m)*2)/2;return ln==0?'Pick':(g
 function bl(g,hs,as){return g.line==null?'—':g.line==0?'Pick':(g.line<0?hs+' −'+(-g.line):as+' −'+g.line)}
 function kt(g){var d=new Date(g.d);return isNaN(d)?'TBD':d.toLocaleString(undefined,{weekday:'short',month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})}
 function rs(e,line,hs,as){if(e==null||Math.abs(e)<.05||line==null)return null;var c=hs-as+line;return c==0?'P':((e>0)==(c>0)?'W':'L')}
-function score(g){var x=L[g.id];if(!x||x.s=='pre')return'—';var t='<span class="big">'+x.as+'–'+x.hs+'</span>';
+function lv(g){return L[g.id]||(g.fin?{s:'post',t:'Final',as:g.fin[0],hs:g.fin[1]}:null)}
+function score(g){var x=lv(g);if(!x||x.s=='pre')return'—';var t='<span class="big">'+x.as+'–'+x.hs+'</span>';
 if(x.s=='in')return t+'<span class="sub live">'+esc(x.t)+'</span>';var r=rs(g.e,g.line,x.hs,x.as);return t+'<span class="sub">Final</span>'+(r?'<span class="pill '+r+'" style="margin-top:4px">'+RW[r]+'</span>':'')}
 function pastBoard(k){var all=PW[k]||[],r=all.filter(function(g){return(!S.fbs||g.fb)&&(!S.q||(nm(g.h,g.hn)+' '+nm(g.a,g.an)).toLowerCase().indexOf(S.q)>=0)});
 var bt=function(a,b){return(a.d||'').localeCompare(b.d||'')};
@@ -607,7 +629,7 @@ if(!r.length){$('#board').innerHTML='<tr><td class="empty" colspan="13">No games
 $('#board').innerHTML=r.map(function(g){var hs=esc(nm(g.h,g.hn)),as=esc(nm(g.a,g.an)),ln=Math.round(Math.abs(g.m)*2)/2,mt=ln==0?'Pick':(g.m>=0?hs:as)+' −'+ln,
 bk=g.line==null?'—':g.line==0?'Pick':(g.line<0?hs+' −'+(-g.line):as+' −'+g.line),
 lt=g.e==null||Math.abs(g.e)<.05?null:(g.e>0?g.h:g.a),d=new Date(g.d),k=isNaN(d)?'TBD':d.toLocaleString(undefined,{weekday:'short',month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
-var lx=L[g.id],ls=lx&&lx.s!='pre'?'<br>'+lx.as+'–'+lx.hs+' '+(lx.s=='in'?'<span class="live">'+esc(lx.t)+'</span>':'Final'):'';
+var lx=lv(g),ls=lx&&lx.s!='pre'?'<br>'+lx.as+'–'+lx.hs+' '+(lx.s=='in'?'<span class="live">'+esc(lx.t)+'</span>':'Final'):'';
 return'<tr class="'+g.sig+'"><td class="l st"><div class="mu"><div class="sd">'+logo(g.a)+'<span class="sc">'+as+'</span></div><span class="at">'+(g.n?'vs':'at')+'</span><div class="sd">'+logo(g.h)+'<span class="sc">'+hs+'</span></div></div>'
 +'<span class="ms">Model '+mt+(g.e!=null?', edge '+Math.abs(g.e).toFixed(1):'')+(g.sig?'<br><span class="pill '+g.sig+'">'+g.sig+'</span>':'')+ls+'</span>'+(g.adj?'<span class="sub" style="text-align:center">includes adjustment</span>':'')+'</td>'
 +'<td>'+score(g)+'</td><td><span class="big">'+mt+'</span></td><td>'+as+' '+Math.round((g.t-g.m)/2)+', '+hs+' '+Math.round((g.t+g.m)/2)+'</td><td>'+g.wp+'%</td>'
@@ -631,7 +653,7 @@ document.querySelectorAll('nav button').forEach(function(b){b.onclick=function()
 $('#scope').onchange=function(){S.scope=this.value;board()};$('#sort').onchange=function(){S.sort=this.value;board()};$('#q').oninput=function(){S.q=this.value.trim().toLowerCase();board()};
 $('#fbs').onchange=function(){S.fbs=this.checked;board()};$('#rshow').onchange=function(){S.rshow=this.value;ratings()};$('#rq').oninput=function(){S.rq=this.value.trim().toLowerCase();ratings()};
 $('#wk').textContent=M.week?'Week '+M.week:'';
-$('#stamp').textContent='Model run '+M.run_at+'. Results through '+M.data_through+'. '+(M.n_lines?M.book+' lines for '+M.n_lines+' games, pulled '+M.lines_at+'.':'No sportsbook lines were available when this page was built.');
+$('#stamp').textContent='Model run '+M.run_at+'. Results through '+M.data_through+'. '+(M.n_lines?M.book+' lines for '+M.n_lines+' games, last pulled '+M.lines_at+' (a game keeps its last line from before kickoff).':'No sportsbook lines were available when this page was built.');
 $('#gnote').innerHTML='Book line and edge use the '+esc(M.book||'sportsbook')+' spread pulled when this page was built. <b>Strong</b> = a 3+ point edge where the market just overreacted the other way. <b>Lean</b> = any other 3+ point edge. <b>Pass</b> = a 3+ point edge on a line of 28 or more.'+(M.adj&&M.adj.length?' Team adjustments included: '+M.adj.map(function(a){return esc(a[0])+' '+f1(a[1])+(a[2]?' ('+esc(a[2])+')':'')}).join(', ')+'.':'');
 var LV=M.live||[],fails=0,tm=null;
 function poll(){clearTimeout(tm);if(!LV.length||fails>=3||!window.fetch||document.hidden)return;
@@ -737,8 +759,9 @@ def main(out_dir, season=None):
     wf['abs_err_model'] = (wf.margin - wf.model_margin).abs(); wf['abs_err_vegas'] = (wf.margin + wf.vegas).abs()
 
     # ---- results.json: this season's finished games as the model saw them beforehand (for the page's past-weeks view)
+    wf['model_total'] = wf.base_home + wf.base_away
     rc = ['game_id', 'season_type', 'week', 'date', 'neutral_site', 'home_id', 'away_id', 'home_team', 'away_team', 'home_score', 'away_score',
-          'vegas', 'core', 'f_out', 'f_to', 'f_rush', 'rx', 'home_edge', 'h_ats1', 'a_ats1', 'fbs_both']
+          'vegas', 'over_under', 'model_total', 'core', 'f_out', 'f_to', 'f_rush', 'rx', 'home_edge', 'h_ats1', 'a_ats1', 'fbs_both']
     rs = wf[rc].copy() if len(g) else pd.DataFrame(columns=rc)
     if len(rs):
         rs['date'] = rs.date.dt.strftime('%Y-%m-%dT%H:%MZ'); rs['game_id'] = rs.game_id.astype(str)

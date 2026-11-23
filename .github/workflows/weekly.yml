@@ -41,7 +41,7 @@ jobs:
           cp out/cfb_spread_model.html index.html
           git config user.name "github-actions[bot]"
           git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
-          git add index.html
+          git add index.html lines
           if git diff --cached --quiet; then echo "No change"; exit 0; fi
           WEEK=$(python -c "import json;print(json.load(open('out/summary.json'))['rows'][0].get('next_week') or '')")
           git commit -m "Week ${WEEK} CFB spread model"
