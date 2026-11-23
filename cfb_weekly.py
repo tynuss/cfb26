@@ -405,6 +405,13 @@ def write_html(out_dir, Y):
         os.makedirs('lines', exist_ok=True); json.dump(lines, open(sp, 'w'), indent=0, sort_keys=True)
     if os.path.exists('lines.json'): lines.update(json.load(open('lines.json')))
     z = lambda v: 0.0 if v is None else float(v)
+    FA = {}
+    try:
+        import csv
+        with open(os.path.join('sentiment', f'{Y}.csv'), newline='') as fh:
+            for r in csv.DictReader(fh): FA[(r['week'], r['team_id'])] = [int(r['attitude']), int(r['n'])]
+    except (OSError, ValueError, KeyError): pass
+    fa = lambda k, a, h: [FA.get((k, a)), FA.get((k, h))] if (FA.get((k, a)) or FA.get((k, h))) else None
     try: past = rd('results.json')
     except (OSError, KeyError, ValueError): past = []
     PG = []
@@ -422,7 +429,7 @@ def write_html(out_dir, Y):
         st = 3 if str(g['season_type']).lower() in ('3', 'post', 'postseason') else 2
         PG.append({'id': str(g['game_id']), 'k': f"{st}-{int(g['week'])}", 'd': g['date'], 'n': bool(g['neutral_site']), 'h': h, 'a': a,
                    'hn': g['home_team'], 'an': g['away_team'], 'm': round(m, 2), 'line': ln, 'e': None if e is None else round(e, 2),
-                   'sig': sig, 'r': res, 'hs': hs, 'as': aw, 'fb': bool(g['fbs_both'])})
+                   'sig': sig, 'r': res, 'hs': hs, 'as': aw, 'fb': bool(g['fbs_both']), 'fa': fa(f"{st}-{int(g['week'])}", a, h)})
     done = {x['id'] for x in PG}; cur = {f"{3 if str(g['season_type']).lower().startswith('post') else 2}-{int(g['week'])}" for g in games if g['this_week']}
     G = []
     for x in past:                       # this week's games already played: keep them on the board with the final score
@@ -437,7 +444,7 @@ def write_html(out_dir, Y):
                   'm': m, 't': round(z(x.get('model_total')), 1), 'wp': int(round(100 * N.cdf(abs(m) / P['sigma']))), 'line': ln,
                   'bt': b.get('total', x.get('over_under')), 'bk': b.get('book') or ('Closing line' if ln is not None else None),
                   'e': None if e is None else round(e, 2), 'sig': sig, 'ha': x['h_ats1'], 'aa': x['a_ats1'], 'he': round(z(x.get('home_edge')), 2),
-                  'tw': True, 'fb': bool(x['fbs_both']), 'adj': False, 'fin': [x['away_score'], x['home_score']]})
+                  'tw': True, 'fb': bool(x['fbs_both']), 'adj': False, 'fin': [x['away_score'], x['home_score']], 'fa': pg['fa']})
     for g in games:
         if str(g['game_id']) in done: continue
         h, a = str(g['home_id']), str(g['away_id'])
@@ -450,7 +457,8 @@ def write_html(out_dir, Y):
         G.append({'id': str(g['game_id']), 'd': g['date'], 'n': bool(g['neutral_site']), 'h': h, 'a': a, 'hn': g['home_team'], 'an': g['away_team'],
                   'm': round(m, 2), 't': round(z(g['model_total']), 1), 'wp': int(round(100 * N.cdf(abs(m) / P['sigma']))), 'line': ln,
                   'bt': b.get('total'), 'bk': b.get('book'), 'e': None if e is None else round(e, 2), 'sig': sig, 'ha': g['h_ats1'], 'aa': g['a_ats1'],
-                  'he': round(z(g.get('home_edge')), 2), 'tw': bool(g['this_week']), 'fb': bool(g['fbs_both']), 'adj': bool(adj.get(h) or adj.get(a))})
+                  'he': round(z(g.get('home_edge')), 2), 'tw': bool(g['this_week']), 'fb': bool(g['fbs_both']), 'adj': bool(adj.get(h) or adj.get(a)),
+                  'fa': fa(f"{3 if str(g['season_type']).lower().startswith('post') else 2}-{int(g['week'])}", a, h)})
     R = []
     for r in ratings:
         i = str(r['team_id'])
@@ -574,6 +582,7 @@ h2{font:700 22px var(--cond);margin:22px 0 10px}.how{max-width:78ch;line-height:
 <li><b>Signals.</b> Lean = model and book differ by 3+ points. Strong = a Lean where the market just overreacted the other way (your side missed by 21+ last game, or the opponent covered by 21+). Pass = a 3+ point edge on a line of 28 or more, where the model's edges have lost.</li>
 <li><b>Lines</b> are the DraftKings spreads pulled when this page was built. They don't change after that.</li>
 <li><b>Live scores</b> for this week's games come from ESPN's public scoreboard while the page is open and online, refreshed every minute during games. Offline, the page works the same without them.</li>
+<li><b>Fan attitude</b> is the mood of the week's coverage of each team (local papers, beat writers, fan sites) from Google News headlines in the 7 days before the week's games: the share of positive vs negative headlines, 50% = neutral. Game-result words are ignored, since the model already has the results. It is tracked only, not used in the model lines.</li>
 <li><b>Past weeks</b> show what the model would have said before each game, using only games played earlier, graded against the closing line. Model pick = the side the model liked against that line.</li>
 <li><b>Win %</b> assumes the final margin lands within about ±16 points of the model line two times out of three.</li>
 </ul></section>
@@ -597,14 +606,15 @@ var PW={};(D.past||[]).forEach(function(g){(PW[g.k]=PW[g.k]||[]).push(g)});
 function wlab(k){var p=k.split('-');return p[0]=='3'?(p[1]=='1'?'Bowls':'Postseason '+p[1]):'Week '+p[1]}
 (function(){var o='<option value="week">This week</option><option value="all">All upcoming</option>',ks=Object.keys(PW).sort(function(a,b){var x=a.split('-'),y=b.split('-');return(y[0]-x[0])||(y[1]-x[1])});
 if(ks.length)o+='<optgroup label="Past weeks: results">'+ks.map(function(k){return'<option value="p:'+k+'">'+wlab(k)+' results</option>'}).join('')+'</optgroup>';$('#scope').innerHTML=o})();
-var HU='<tr><th class="l st">Matchup</th><th>Score</th><th>Model line</th><th>Projected score</th><th>Fav. win %</th><th>Book line</th><th>Edge</th><th class="l">Lean</th><th class="l">Signal</th><th>Total: model / book</th><th>Last game vs spread</th><th>Home field</th><th class="l">Kickoff</th></tr>',
-HP='<tr><th class="l st">Matchup</th><th>Final</th><th>Model line</th><th>Closing line</th><th>Edge</th><th class="l">Model pick</th><th class="l">Against the spread</th><th class="l">Signal</th><th class="l">Kickoff</th></tr>';
+var HU='<tr><th class="l st">Matchup</th><th>Score</th><th>Model line</th><th>Projected score</th><th>Fav. win %</th><th>Book line</th><th>Edge</th><th class="l">Lean</th><th class="l">Signal</th><th>Fan attitude</th><th>Total: model / book</th><th>Last game vs spread</th><th>Home field</th><th class="l">Kickoff</th></tr>',
+HP='<tr><th class="l st">Matchup</th><th>Final</th><th>Model line</th><th>Closing line</th><th>Edge</th><th class="l">Model pick</th><th class="l">Against the spread</th><th class="l">Signal</th><th>Fan attitude</th><th class="l">Kickoff</th></tr>';
 function mu(g,hs,as,extra){return'<td class="l st"><div class="mu"><div class="sd">'+logo(g.a)+'<span class="sc">'+as+'</span></div><span class="at">'+(g.n?'vs':'at')+'</span><div class="sd">'+logo(g.h)+'<span class="sc">'+hs+'</span></div></div>'+(extra||'')+'</td>'}
 function ml(g,hs,as){var ln=Math.round(Math.abs(g.m)*2)/2;return ln==0?'Pick':(g.m>=0?hs:as)+' −'+ln}
 function bl(g,hs,as){return g.line==null?'—':g.line==0?'Pick':(g.line<0?hs+' −'+(-g.line):as+' −'+g.line)}
 function kt(g){var d=new Date(g.d);return isNaN(d)?'TBD':d.toLocaleString(undefined,{weekday:'short',month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})}
 function rs(e,line,hs,as){if(e==null||Math.abs(e)<.05||line==null)return null;var c=hs-as+line;return c==0?'P':((e>0)==(c>0)?'W':'L')}
 function lv(g){return L[g.id]||(g.fin?{s:'post',t:'Final',as:g.fin[0],hs:g.fin[1]}:null)}
+function fat(g){if(!g.fa)return'—';var f=function(x){return x?'<span title="'+x[1]+' headlines">'+x[0]+'%</span>':'—'};return'<span class="big">'+f(g.fa[0])+' – '+f(g.fa[1])+'</span><span class="sub">away – home</span>'}
 function score(g){var x=lv(g);if(!x||x.s=='pre')return'—';var t='<span class="big">'+x.as+'–'+x.hs+'</span>';
 if(x.s=='in')return t+'<span class="sub live">'+esc(x.t)+'</span>';var r=rs(g.e,g.line,x.hs,x.as);return t+'<span class="sub">Final</span>'+(r?'<span class="pill '+r+'" style="margin-top:4px">'+RW[r]+'</span>':'')}
 function pastBoard(k){var all=PW[k]||[],r=all.filter(function(g){return(!S.fbs||g.fb)&&(!S.q||(nm(g.h,g.hn)+' '+nm(g.a,g.an)).toLowerCase().indexOf(S.q)>=0)});
@@ -613,19 +623,19 @@ r.sort(S.sort=='edge'?function(a,b){return ae(b)-ae(a)||bt(a,b)}:S.sort=='signal
 $('#bh').innerHTML=HP;
 var cnt=function(f){var w=0,l=0;all.forEach(function(g){if((!S.fbs||g.fb)&&f(g)){if(g.r=='W')w++;else if(g.r=='L')l++}});return w+l?w+'–'+l+' ('+(100*w/(w+l)).toFixed(1)+'%)':'—'};
 $('#wsum').hidden=false;$('#wsum').innerHTML='<b>'+wlab(k)+'</b>'+(S.fbs?', FBS vs FBS':'')+'. Model picks against the closing line: all games '+cnt(function(){return true})+'; 3+ edges '+cnt(function(g){return g.e!=null&&Math.abs(g.e)>=3&&g.sig!='Pass'})+'; Strong '+cnt(function(g){return g.sig=='Strong'})+'.';
-if(!r.length){$('#board').innerHTML='<tr><td class="empty" colspan="9">No games match. Clear the search or untick "FBS vs FBS only".</td></tr>';return}
+if(!r.length){$('#board').innerHTML='<tr><td class="empty" colspan="10">No games match. Clear the search or untick "FBS vs FBS only".</td></tr>';return}
 $('#board').innerHTML=r.map(function(g){var hs=esc(nm(g.h,g.hn)),as=esc(nm(g.a,g.an)),pk=g.e==null||Math.abs(g.e)<.05?null:(g.e>0?g.h:g.a);
 return'<tr class="'+g.sig+'">'+mu(g,hs,as,'<span class="ms">'+g.as+'–'+g.hs+(g.r?' <span class="pill '+g.r+'">'+RW[g.r]+'</span>':'')+'</span>')
 +'<td><span class="big">'+g.as+'–'+g.hs+'</span></td><td><span class="big">'+ml(g,hs,as)+'</span></td><td>'+bl(g,hs,as)+'</td>'
 +'<td>'+(g.e==null?'—':Math.abs(g.e).toFixed(1))+'</td><td class="l">'+(pk==null?'—':'<span class="tm">'+logo(pk)+esc(nm(pk))+'</span>')+'</td>'
 +'<td class="l">'+(g.r?'<span class="pill '+g.r+'">'+RW[g.r]+'</span>':'—')+'</td>'
-+'<td class="l">'+(g.sig?'<span class="pill '+g.sig+'">'+g.sig+'</span>':'—')+'</td><td class="l">'+kt(g)+'</td></tr>'}).join('')}
++'<td class="l">'+(g.sig?'<span class="pill '+g.sig+'">'+g.sig+'</span>':'—')+'</td><td>'+fat(g)+'</td><td class="l">'+kt(g)+'</td></tr>'}).join('')}
 function ae(g){return g.e==null?-1:Math.abs(g.e)}
 function board(){if(S.scope.slice(0,2)=='p:')return pastBoard(S.scope.slice(2));$('#wsum').hidden=true;$('#bh').innerHTML=HU;
 var r=D.games.filter(function(g){return(S.scope=='all'||g.tw)&&(!S.fbs||g.fb)&&(!S.q||(nm(g.h,g.hn)+' '+nm(g.a,g.an)).toLowerCase().indexOf(S.q)>=0)});
 var bt=function(a,b){return(a.d||'').localeCompare(b.d||'')};
 r.sort(S.sort=='edge'?function(a,b){return ae(b)-ae(a)||bt(a,b)}:S.sort=='signal'?function(a,b){return RK[a.sig]-RK[b.sig]||ae(b)-ae(a)}:S.sort=='close'?function(a,b){return Math.abs(a.m)-Math.abs(b.m)}:bt);
-if(!r.length){$('#board').innerHTML='<tr><td class="empty" colspan="13">No games match. Try "All upcoming" or clear the search.</td></tr>';return}
+if(!r.length){$('#board').innerHTML='<tr><td class="empty" colspan="14">No games match. Try "All upcoming" or clear the search.</td></tr>';return}
 $('#board').innerHTML=r.map(function(g){var hs=esc(nm(g.h,g.hn)),as=esc(nm(g.a,g.an)),ln=Math.round(Math.abs(g.m)*2)/2,mt=ln==0?'Pick':(g.m>=0?hs:as)+' −'+ln,
 bk=g.line==null?'—':g.line==0?'Pick':(g.line<0?hs+' −'+(-g.line):as+' −'+g.line),
 lt=g.e==null||Math.abs(g.e)<.05?null:(g.e>0?g.h:g.a),d=new Date(g.d),k=isNaN(d)?'TBD':d.toLocaleString(undefined,{weekday:'short',month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
@@ -636,7 +646,7 @@ return'<tr class="'+g.sig+'"><td class="l st"><div class="mu"><div class="sd">'+
 +'<td><span class="big">'+bk+'</span>'+(g.line!=null?'<span class="sub">'+esc(g.bk||'')+'</span>':'')+'</td>'
 +'<td><span class="big'+(g.e!=null&&Math.abs(g.e)>=3&&g.sig!='Pass'?' pos':'')+'">'+(g.e==null?'—':Math.abs(g.e).toFixed(1))+'</span></td>'
 +'<td class="l">'+(lt==null?'—':'<span class="tm">'+logo(lt)+esc(nm(lt))+'</span>')+'</td>'
-+'<td class="l">'+(g.sig?'<span class="pill '+g.sig+'">'+g.sig+(g.sig=='Pass'?' (28+ line)':'')+'</span>':'—')+'</td>'
++'<td class="l">'+(g.sig?'<span class="pill '+g.sig+'">'+g.sig+(g.sig=='Pass'?' (28+ line)':'')+'</span>':'—')+'</td><td>'+fat(g)+'</td>'
 +'<td>'+g.t.toFixed(1)+' / '+(g.bt==null?'—':(+g.bt).toFixed(1))+'</td><td>'+as+' '+f1(g.aa)+'<span class="sub">'+hs+' '+f1(g.ha)+'</span></td>'
 +'<td>'+(g.n?'Neutral':sg(g.he,.5,-.5))+'</td><td class="l">'+k+'</td></tr>'}).join('')}
 function ratings(){var r=D.ratings;if(S.rq)r=r.filter(function(t){return nm(t.id,t.tn).toLowerCase().indexOf(S.rq)>=0});else if(S.rshow=='25')r=r.slice(0,25);
@@ -790,6 +800,15 @@ def main(out_dir, season=None):
     s['hfa'] = P['H']; s['sigma'] = P['sigma']; s['react_dz'] = REACT_DZ; s['strong_rs'] = STRONG_RS; s['big_spread'] = BIG_SPREAD
     s['home_edge_sd'] = round(float(he.reindex(fb.index).std()), 2)
     dump('summary.json', s)
+    if os.environ.get('CFB_FAN') and len(U):
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import fan_sentiment
+            tw = U[U.this_week]
+            for st, d in tw.groupby(tw.season_type.astype(str).str.lower().str.startswith('post')):
+                ids = sorted((set(d.home_id) | set(d.away_id)) & set(fb.index))
+                fan_sentiment.week(Y, f"{3 if st else 2}-{int(d.week.min())}", now.tz_convert('America/Chicago').date().isoformat(), ids)
+        except Exception as e:
+            print('fan attitude skipped:', e)
     write_html(out_dir, Y)
 
 if __name__ == '__main__':

@@ -25,9 +25,11 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install packages
-        run: pip install pandas numpy scipy pyarrow pillow
+        run: pip install pandas numpy scipy pyarrow pillow vaderSentiment
       - name: Run the model
         run: python cfb_weekly.py out
+        env:
+          CFB_FAN: "1"   # score this week's fan attitude from Google News headlines
       - name: Check output
         run: |
           python - <<'PY'
@@ -41,7 +43,7 @@ jobs:
           cp out/cfb_spread_model.html index.html
           git config user.name "github-actions[bot]"
           git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
-          git add index.html lines
+          git add index.html lines sentiment
           if git diff --cached --quiet; then echo "No change"; exit 0; fi
           WEEK=$(python -c "import json;print(json.load(open('out/summary.json'))['rows'][0].get('next_week') or '')")
           git commit -m "Week ${WEEK} CFB spread model"
