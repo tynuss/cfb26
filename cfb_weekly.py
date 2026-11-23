@@ -2,8 +2,10 @@
 Ratings: offense/defense points ratings (preseason prior + this season's games, recency-weighted, blowouts capped), blended
 with ten opponent-adjusted team stats (fit on 2022-2025), plus emphasised factors (wins over preseason expectation, turnover
 margin, rush share, Vegas reaction to last game's cover margin) and each team's own home edge (previous 14 seasons).
-Writes ratings.json, games.json, summary.json ({rows, meta}) for the dashboard and cfb_spread_model.html, an offline
-presentation page with DraftKings lines (ESPN's public odds feed), edges and Strong/Lean/Pass signals baked in.
+Model line vs the book: the sportsbook line plus an adjustment learned from those same inputs (where the market has tended to be
+wrong), fit on 2008-2025 games with the last 4 seasons counted fully and older seasons x0.8 per year back. Lean = 2+ point edge.
+Writes ratings.json, games.json, summary.json ({rows, meta}) and cfb_spread_model.html, an offline presentation page with DraftKings
+lines (ESPN's public odds feed), edges and Lean signals baked in.
 Reads public sportsdataverse data (GitHub releases + cfbfastR-data raw files), ESPN odds and ESPN logos.
 """
 import os, sys, json, subprocess, datetime as dt
@@ -16,7 +18,6 @@ WEAK = dict(P, lam=0.6, decay=1.0, w_mkt=0.0)            # season-end ratings us
 PRIOR_COEF = {"o": [-1.5247, 0.4154, 1.8623, 1.0449, 0.0284], "d": [-1.2986, 0.417, 1.9915, 1.1579, 0.0221]}   # fit on 2022-2025 season-end ratings
 W = dict(w_out=0.6, w_to=-1.5, w_rush=0.03, w_react=0.2)   # emphasised factor weights, tuned on 2022-2025 ATS (points per unit)
 REACT_DZ = 7          # last-game cover margin beyond +/-7 counts toward the Vegas-reaction factor
-STRONG_RS = 21        # 'Strong' spot: 3+ pt edge and the picked side's last game swung the market 21+ the other way
 STATS = ['EPA_per_play', 'yards_per_play', 'EPA_rushing_per_play', 'EPA_passing_per_play', 'EPA_explosive_rate',
          'first_downs_created_rate', 'rushing_stuff_rate', 'line_yards_per_carry', 'EPA_special_teams', 'EPA_penalty']
 STAGE2 = {"c0": 0.1165, "b": {"p_margin_base": 1.16634, "home": -1.02443, "s_EPA_per_play": -32.18952, "s_yards_per_play": 1.80299,
@@ -24,6 +25,8 @@ STAGE2 = {"c0": 0.1165, "b": {"p_margin_base": 1.16634, "home": -1.02443, "s_EPA
           "s_first_downs_created_rate": 39.99544, "s_rushing_stuff_rate": -22.01354, "s_line_yards_per_carry": 2.31324,
           "s_EPA_special_teams": -0.32973, "s_EPA_penalty": -0.17491}}   # ridge fit on 2022-2025 FBS games
 MIN_GP = 3
+ANCHOR = {"c0": 0.53693, "b": {"p_margin_base": 0.00866, "home": -0.60956, "s_EPA_per_play": -4.86057, "s_yards_per_play": 0.00318, "s_EPA_rushing_per_play": 0.52598, "s_EPA_passing_per_play": -0.87528, "s_EPA_explosive_rate": 3.06124, "s_first_downs_created_rate": 4.29072, "s_rushing_stuff_rate": -15.65407, "s_line_yards_per_carry": 1.21319, "s_EPA_special_teams": 0.08974, "s_EPA_penalty": 0.00526, "f_out": 0.04523, "f_to": -0.2819, "f_rush": 0.02264, "rx": 0.00208}}   # line adjustment: fit on 2008-2025 closing lines, recency-weighted
+LEAN = 2.0            # Lean: model line and book line differ by 2+ points (2010-2025, each season fit on earlier ones: 1065-912, 53.9%)
 
 REL = 'https://github.com/sportsdataverse/sportsdataverse-data/releases/download'
 RAW = 'https://raw.githubusercontent.com/sportsdataverse/cfbfastR-data/main'
@@ -251,7 +254,8 @@ def matchup(cur, R, mu, SR, f, la, lg_rush, prior, he=None):
     c['a_ats1'] = la.reindex(c.away_id).values if len(la) else np.nan
     c['rx'] = react(c.h_ats1.fillna(0)) - react(c.a_ats1.fillna(0))
     c['home_edge'] = (he.reindex(c.home_id).fillna(0.0).values if he is not None else 0.0) * c.home
-    c['model_margin'] = c.core + W['w_out']*fo + W['w_to']*ft + W['w_rush']*fr + W['w_react']*c.rx + c.home_edge
+    c['model_margin'] = c.core + W['w_out']*fo + W['w_to']*ft + W['w_rush']*fr + W['w_react']*c.rx + c.home_edge   # ratings-only line (no book)
+    c['adj'] = ANCHOR['c0'] + sum(c[k] * v for k, v in ANCHOR['b'].items())                                     # points the book line is off by
     return c
 
 def state_at(g, prior, stat_rows_all, t0):
@@ -289,7 +293,6 @@ def team_power(R, SR, f, lg_rush, idx):
 
 # ---------------- team-specific home field ----------------
 HOME_EDGE = dict(window=14, decay=0.8, lam_x=60.0, lam_r=0.5)   # tuned walk-forward on 2022-2026
-BIG_SPREAD = 28.0     # no Lean/Strong signal when the book line is this big: 3+ edges there went 59-68 in 2022-26
 
 def team_home_edge(Y, fbs_index, refresh=False):
     """Each team's home-field edge above the FBS average, in points, from actual margins in the previous
@@ -322,10 +325,26 @@ def team_home_edge(Y, fbs_index, refresh=False):
     return x.reindex(fbs_index).fillna(0.0).combine_first(x)
 
 # ---------------- presentation page ----------------
-BACKTEST = [  # season, games, model miss, Vegas miss, 3+ W-L, 5+ W-L, Strong W-L, previous version 3+ W-L (walk-forward vs closing lines)
-    ['2022', 763, 12.66, 12.26, 216, 179, 118, 89, 66, 49, 225, 197], ['2023', 777, 12.81, 12.48, 203, 193, 109, 108, 55, 64, 216, 201],
-    ['2024', 781, 12.80, 12.54, 231, 192, 154, 117, 70, 52, 232, 203], ['2025', 793, 12.40, 12.23, 209, 161, 106, 94, 74, 53, 221, 177],
-    ['2026 (to Nov 19)', 624, 12.58, 11.92, 140, 151, 83, 79, 45, 36, 152, 169], ['2022–25 total', 3114, 12.67, 12.37, 859, 725, 487, 408, 265, 218, 894, 778]]
+BACKTEST = [  # season, games, model miss, Vegas miss, Lean W-L, 3+ W-L, all picks W-L, previous model 3+ W-L; each season fit only on earlier seasons
+    ["2010", 602, 12.41, 12.4, 110, 82, 61, 44, 307, 283, 154, 139],
+    ["2011", 672, 12.11, 12.1, 90, 90, 38, 25, 339, 324, 157, 145],
+    ["2012", 702, 12.11, 12.09, 106, 95, 46, 37, 355, 333, 169, 149],
+    ["2013", 707, 12.37, 12.43, 101, 86, 33, 38, 381, 319, 149, 149],
+    ["2014", 734, 12.49, 12.48, 99, 83, 37, 28, 371, 356, 180, 177],
+    ["2015", 737, 12.25, 12.33, 97, 60, 29, 11, 387, 340, 197, 166],
+    ["2016", 729, 12.9, 12.81, 70, 76, 20, 31, 365, 350, 170, 175],
+    ["2017", 746, 12.39, 12.3, 67, 79, 14, 24, 359, 370, 184, 200],
+    ["2018", 752, 12.51, 12.54, 59, 39, 15, 12, 377, 362, 170, 181],
+    ["2019", 748, 12.17, 12.18, 60, 45, 14, 12, 375, 358, 160, 168],
+    ["2020", 534, 12.83, 12.88, 32, 15, 9, 5, 276, 248, 156, 147],
+    ["2021", 770, 12.59, 12.54, 37, 49, 7, 11, 378, 381, 189, 189],
+    ["2022", 776, 12.02, 12.02, 35, 27, 5, 5, 392, 371, 213, 173],
+    ["2023", 792, 12.08, 12.12, 35, 20, 2, 3, 414, 363, 204, 188],
+    ["2024", 798, 12.12, 12.07, 44, 52, 11, 5, 390, 391, 216, 178],
+    ["2025", 808, 11.8, 11.82, 23, 14, 2, 1, 423, 369, 212, 171],
+    ["2010–2021 total", 8433, 12.42, 12.42, 928, 799, 323, 278, 4270, 4024, 2035, 1985],
+    ["2022–2025 total", 3174, 12.0, 12.01, 137, 113, 20, 14, 1619, 1494, 845, 710],
+    ["2010–2025 total", 11607, 12.31, 12.3, 1065, 912, 343, 292, 5889, 5518, 2880, 2695]]
 ODDS = 'https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?dates={y}&seasontype={st}&week={wk}&groups=80&limit=400'
 LOGO = 'https://a.espncdn.com/i/teamlogos/ncaa/500/{}.png'
 
@@ -425,13 +444,13 @@ def write_html(out_dir, Y):
         h, a = str(g['home_id']), str(g['away_id'])
         m = (z(g['core']) + w['w_out']*z(g['f_out']) + w['w_to']*z(g['f_to']) + w['w_rush']*z(g['f_rush']) + w['w_react']*z(g['rx'])
              + z(g.get('home_edge')))
-        ln = g.get('vegas'); e = None if ln is None else m + ln; hs, aw = g['home_score'], g['away_score']; sig = ''; res = None
+        ln = g.get('vegas'); hs, aw = g['home_score'], g['away_score']; sig = ''; res = None
+        if ln is not None: m = -ln + z(g.get('adj'))
+        e = None if ln is None else m + ln
         if e is not None and abs(e) >= 0.05:
             c = (z(hs) - z(aw)) + ln
             res = 'P' if c == 0 else ('W' if (e > 0) == (c > 0) else 'L')
-            if abs(e) >= 3:
-                pk, op = (g['h_ats1'], g['a_ats1']) if e > 0 else (g['a_ats1'], g['h_ats1'])
-                sig = 'Pass' if abs(ln) >= BIG_SPREAD else ('Strong' if max(-z(pk), z(op)) >= STRONG_RS else 'Lean')
+            sig = 'Lean' if abs(e) >= LEAN else ''
         st = 3 if str(g['season_type']).lower() in ('3', 'post', 'postseason') else 2
         PG.append({'id': str(g['game_id']), 'k': f"{st}-{int(g['week'])}", 'd': g['date'], 'n': bool(g['neutral_site']), 'h': h, 'a': a,
                    'hn': g['home_team'], 'an': g['away_team'], 'm': round(m, 2), 'line': ln, 'e': None if e is None else round(e, 2),
@@ -442,10 +461,8 @@ def write_html(out_dir, Y):
         k = f"{3 if str(x['season_type']).lower() in ('3', 'post', 'postseason') else 2}-{int(x['week'])}"
         if k not in cur: continue
         h, a = str(x['home_id']), str(x['away_id']); pg = next(q for q in PG if q['id'] == str(x['game_id']))
-        b = lines.get(str(x['game_id'])) or {}; ln = b.get('line', x.get('vegas')); m = pg['m']; e = None if ln is None else m + ln; sig = ''
-        if e is not None and abs(e) >= 3:
-            pk, op = (x['h_ats1'], x['a_ats1']) if e > 0 else (x['a_ats1'], x['h_ats1'])
-            sig = 'Pass' if abs(ln) >= BIG_SPREAD else ('Strong' if max(-z(pk), z(op)) >= STRONG_RS else 'Lean')
+        b = lines.get(str(x['game_id'])) or {}; ln = b.get('line', x.get('vegas')); m = pg['m'] if ln is None else -ln + z(x.get('adj'))
+        e = None if ln is None else m + ln; sig = 'Lean' if e is not None and abs(e) >= LEAN else ''
         G.append({'id': pg['id'], 'd': x['date'], 'n': bool(x['neutral_site']), 'h': h, 'a': a, 'hn': x['home_team'], 'an': x['away_team'],
                   'm': m, 't': round(z(x.get('model_total')), 1), 'wp': int(round(100 * N.cdf(abs(m) / P['sigma']))), 'line': ln,
                   'bt': b.get('total', x.get('over_under')), 'bk': b.get('book') or ('Closing line' if ln is not None else None),
@@ -456,10 +473,9 @@ def write_html(out_dir, Y):
         h, a = str(g['home_id']), str(g['away_id'])
         m = (z(g['core']) + w['w_out']*z(g['f_out']) + w['w_to']*z(g['f_to']) + w['w_rush']*z(g['f_rush']) + w['w_react']*z(g['rx'])
              + z(g.get('home_edge')) + adj.get(h, 0) - adj.get(a, 0))
-        b = lines.get(str(g['game_id'])) or {}; ln = b.get('line'); e = None if ln is None else m + ln; sig = ''
-        if e is not None and abs(e) >= 3:
-            pk, op = (g['h_ats1'], g['a_ats1']) if e > 0 else (g['a_ats1'], g['h_ats1'])
-            sig = 'Pass' if abs(ln) >= BIG_SPREAD else ('Strong' if max(-z(pk), z(op)) >= STRONG_RS else 'Lean')
+        b = lines.get(str(g['game_id'])) or {}; ln = b.get('line')
+        if ln is not None: m = -ln + z(g.get('adj')) + adj.get(h, 0) - adj.get(a, 0)
+        e = None if ln is None else m + ln; sig = 'Lean' if e is not None and abs(e) >= LEAN else ''
         G.append({'id': str(g['game_id']), 'd': g['date'], 'n': bool(g['neutral_site']), 'h': h, 'a': a, 'hn': g['home_team'], 'an': g['away_team'],
                   'm': round(m, 2), 't': round(z(g['model_total']), 1), 'wp': int(round(100 * N.cdf(abs(m) / P['sigma']))), 'line': ln,
                   'bt': b.get('total'), 'bk': b.get('book'), 'e': None if e is None else round(e, 2), 'sig': sig, 'ha': g['h_ats1'], 'aa': g['a_ats1'],
@@ -530,10 +546,10 @@ tr:last-child td{border-bottom:0}.l{text-align:left}
 .sc{font:600 13px/1.1 var(--cond);text-align:center;white-space:normal;max-width:76px}
 .at{align-self:center;margin-top:-16px;font:600 13px var(--cond);color:var(--muted)}
 .ms{display:none}
-tr.Strong .st{box-shadow:inset 4px 0 0 var(--strong),1px 0 0 var(--line)}tr.Lean .st{box-shadow:inset 4px 0 0 var(--lean),1px 0 0 var(--line)}
+tr.Strong .st{box-shadow:inset 4px 0 0 var(--strong),1px 0 0 var(--line)}tr.Lean .st{box-shadow:inset 4px 0 0 var(--strong),1px 0 0 var(--line)}
 .big{font:600 18px/1.1 var(--cond)}.sub{display:block;color:var(--muted);font-size:12px;margin-top:2px}
 .pill{display:inline-block;border-radius:999px;padding:2px 10px;font:600 14px var(--cond)}
-.pill.Strong{background:var(--strong-bg);color:var(--strong)}.pill.Lean{background:var(--lean-bg);color:var(--lean)}.pill.Pass{color:var(--pass);border:1px solid var(--line)}
+.pill.Strong{background:var(--strong-bg);color:var(--strong)}.pill.Lean{background:var(--strong-bg);color:var(--strong)}.pill.Pass{color:var(--pass);border:1px solid var(--line)}
 .pos{color:var(--strong)}.neg{color:var(--neg)}
 .tm{display:inline-flex;align-items:center;gap:8px}.tm .lg,.tm .mo{width:24px;height:24px;font-size:10px}
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:18px}
@@ -562,7 +578,7 @@ h2{font:700 22px var(--cond);margin:22px 0 10px}.how{max-width:78ch;line-height:
 <section id="games">
 <div class="ctl">
 <select id="scope" aria-label="Which week"></select>
-<select id="sort" aria-label="Sort games"><option value="time">By kickoff</option><option value="edge">Biggest edge</option><option value="signal">Strong first</option><option value="close">Closest games</option></select>
+<select id="sort" aria-label="Sort games"><option value="time">By kickoff</option><option value="edge">Biggest edge</option><option value="signal">Leans first</option><option value="close">Closest games</option></select>
 <input type="search" id="q" placeholder="Find a team" aria-label="Find a team">
 <label class="chk"><input type="checkbox" id="fbs" checked> FBS vs FBS only</label>
 </div>
@@ -579,15 +595,16 @@ h2{font:700 22px var(--cond);margin:22px 0 10px}.how{max-width:78ch;line-height:
 <section id="record" hidden>
 <div class="tiles" id="tiles"></div>
 <h2>Backtest by season</h2>
-<div class="tw"><table><thead><tr><th class="l">Season</th><th>Games</th><th>Model miss</th><th>Vegas miss</th><th>ATS, 3+ edge</th><th>ATS, 5+ edge</th><th>Strong spots</th><th>Previous version, 3+</th></tr></thead><tbody id="bt"></tbody></table></div>
-<p class="note">Each game predicted only from earlier games and graded against the closing line, FBS vs FBS. 52.4% breaks even at standard odds.</p>
+<div class="tw"><table><thead><tr><th class="l">Season</th><th>Games</th><th>Model miss</th><th>Vegas miss</th><th>Leans (2+ pts)</th><th>3+ point edges</th><th>Every pick</th><th>Previous model, 3+</th></tr></thead><tbody id="bt"></tbody></table></div>
+<p class="note">FBS vs FBS, graded against the closing line; 52.4% breaks even at standard odds. Every game is predicted from earlier games only, and each season uses model weights fit only on earlier seasons (2010 on 2008–09 alone). Previous model: the version before the November 2026 update, whose weights were tuned on 2022–25, so its numbers for those seasons flatter it.</p>
 </section>
 <section id="how" hidden><ul class="how">
 <li><b>Scoring ratings.</b> Each team has an offense and a defense rating in points, adjusted for opponent and home field, starting from a preseason prior (last season, roster talent, returning production) that fades as games come in. Recent games count more; blowouts past 30 are mostly ignored.</li>
 <li><b>Team stats.</b> Ten opponent-adjusted stats (EPA per play, yards per play, rushing and passing EPA, explosive plays, first-down rate, run-stuff rate, line yards, special teams, penalties) are blended with the scoring rating by a regression fit on 2022–2025 FBS games.</li>
-<li><b>Emphasised factors</b> (after 3+ games): wins over preseason expectation (bonus), turnover margin (fades lucky teams), rush rate (small bonus), and Vegas reaction (a big miss or cover last game pushes the line the other way).</li>
+<li><b>Factors</b> (after 3+ games): wins over preseason expectation, turnover margin, rush rate, and how the market reacted to last week's result.</li>
+<li><b>Model line.</b> The model starts from the sportsbook line and adjusts it by what these inputs say the market tends to miss. The adjustment was fit on 2008–2025 games, with the last 4 seasons counted fully and older seasons a little less each year back. Games with no book line show the ratings-only line.</li>
 <li><b>Home field.</b> League average plus each team's own home edge from its previous 14 seasons, pulled toward average.</li>
-<li><b>Signals.</b> Lean = model and book differ by 3+ points. Strong = a Lean where the market just overreacted the other way (your side missed by 21+ last game, or the opponent covered by 21+). Pass = a 3+ point edge on a line of 28 or more, where the model's edges have lost.</li>
+<li><b>Lean</b> = the model line and the book line differ by 2+ points. Tested 2010–2025, each season with weights fit only on earlier seasons: 1,065–912 (53.9%) against closing lines.</li>
 <li><b>Lines</b> are the DraftKings spreads pulled when this page was built. They don't change after that.</li>
 <li><b>Live scores</b> for this week's games come from ESPN's public scoreboard while the page is open and online, refreshed every minute during games. Offline, the page works the same without them.</li>
 <li><b>Defense Dog</b> tags a home underdog with a top-25 defense (model rating at kickoff), from week 5 on. Tested on 2010–2026 closing lines, these teams covered 136–143 (49%), so the tag is tracked, not used in the model lines; past weeks show how they did.</li>
@@ -610,7 +627,7 @@ if(!/^\d+$/.test(id))return mo;
 return'<img class="lg" alt="'+esc(nm(id))+'" src="https://a.espncdn.com/i/teamlogos/ncaa/500/'+id+'.png" data-mo="'+encodeURIComponent(mo)+'">'}
 document.addEventListener('error',function(e){var i=e.target;if(i.dataset&&i.dataset.mo)i.outerHTML=decodeURIComponent(i.dataset.mo)},true);
 function sg(x,hi,lo){return x==null?'—':'<span class="'+(x>hi?'pos':x<lo?'neg':'')+'">'+f1(x)+'</span>'}
-var S={scope:'week',sort:'time',q:'',fbs:true,rshow:'25',rq:''},RK={Strong:0,Lean:1,Pass:2,'':3},L={},RW={W:'Covered',L:'Missed',P:'Push'};
+var S={scope:'week',sort:'time',q:'',fbs:true,rshow:'25',rq:''},RK={Lean:0,Strong:0,Pass:1,'':2},L={},RW={W:'Covered',L:'Missed',P:'Push'};
 var PW={};(D.past||[]).forEach(function(g){(PW[g.k]=PW[g.k]||[]).push(g)});
 function wlab(k){var p=k.split('-');return p[0]=='3'?(p[1]=='1'?'Bowls':'Postseason '+p[1]):'Week '+p[1]}
 (function(){var o='<option value="week">This week</option><option value="all">All upcoming</option>',ks=Object.keys(PW).sort(function(a,b){var x=a.split('-'),y=b.split('-');return(y[0]-x[0])||(y[1]-x[1])});
@@ -632,7 +649,7 @@ var bt=function(a,b){return(a.d||'').localeCompare(b.d||'')};
 r.sort(S.sort=='edge'?function(a,b){return ae(b)-ae(a)||bt(a,b)}:S.sort=='signal'?function(a,b){return RK[a.sig]-RK[b.sig]||ae(b)-ae(a)}:S.sort=='close'?function(a,b){return Math.abs(a.m)-Math.abs(b.m)}:bt);
 $('#bh').innerHTML=HP;
 var cnt=function(f){var w=0,l=0;all.forEach(function(g){if((!S.fbs||g.fb)&&f(g)){if(g.r=='W')w++;else if(g.r=='L')l++}});return w+l?w+'–'+l+' ('+(100*w/(w+l)).toFixed(1)+'%)':'—'};
-$('#wsum').hidden=false;$('#wsum').innerHTML='<b>'+wlab(k)+'</b>'+(S.fbs?', FBS vs FBS':'')+'. Model picks against the closing line: all games '+cnt(function(){return true})+'; 3+ edges '+cnt(function(g){return g.e!=null&&Math.abs(g.e)>=3&&g.sig!='Pass'})+'; Strong '+cnt(function(g){return g.sig=='Strong'})+'.'+(function(){var w=0,l=0;all.forEach(function(g){if(g.dd&&(!S.fbs||g.fb)){var c=g.hs-g.as+g.line;if(c>0)w++;else if(c<0)l++}});return w+l?' Defense Dogs covered '+w+'–'+l+'.':''})();
+$('#wsum').hidden=false;$('#wsum').innerHTML='<b>'+wlab(k)+'</b>'+(S.fbs?', FBS vs FBS':'')+'. Model picks against the closing line: all games '+cnt(function(){return true})+'; Leans (2+ pts) '+cnt(function(g){return g.sig=='Lean'})+'; 3+ edges '+cnt(function(g){return g.e!=null&&Math.abs(g.e)>=3})+'.'+(function(){var w=0,l=0;all.forEach(function(g){if(g.dd&&(!S.fbs||g.fb)){var c=g.hs-g.as+g.line;if(c>0)w++;else if(c<0)l++}});return w+l?' Defense Dogs covered '+w+'–'+l+'.':''})();
 if(!r.length){$('#board').innerHTML='<tr><td class="empty" colspan="10">No games match. Clear the search or untick "FBS vs FBS only".</td></tr>';return}
 $('#board').innerHTML=r.map(function(g){var hs=esc(nm(g.h,g.hn)),as=esc(nm(g.a,g.an)),pk=g.e==null||Math.abs(g.e)<.05?null:(g.e>0?g.h:g.a);
 return'<tr class="'+g.sig+'">'+mu(g,hs,as,'<span class="ms">'+g.as+'–'+g.hs+(g.r?' <span class="pill '+g.r+'">'+RW[g.r]+'</span>':'')+'</span>')
@@ -654,7 +671,7 @@ return'<tr class="'+g.sig+'"><td class="l st"><div class="mu"><div class="sd">'+
 +'<span class="ms">Model '+mt+(g.e!=null?', edge '+Math.abs(g.e).toFixed(1):'')+(g.sig?'<br><span class="pill '+g.sig+'">'+g.sig+'</span>':'')+(g.dd?'<br>'+ddp(g):'')+ls+'</span>'+(g.adj?'<span class="sub" style="text-align:center">includes adjustment</span>':'')+'</td>'
 +'<td>'+score(g)+'</td><td><span class="big">'+mt+'</span></td><td>'+as+' '+Math.round((g.t-g.m)/2)+', '+hs+' '+Math.round((g.t+g.m)/2)+'</td><td>'+g.wp+'%</td>'
 +'<td><span class="big">'+bk+'</span>'+(g.line!=null?'<span class="sub">'+esc(g.bk||'')+'</span>':'')+'</td>'
-+'<td><span class="big'+(g.e!=null&&Math.abs(g.e)>=3&&g.sig!='Pass'?' pos':'')+'">'+(g.e==null?'—':Math.abs(g.e).toFixed(1))+'</span></td>'
++'<td><span class="big'+(g.sig=='Lean'?' pos':'')+'">'+(g.e==null?'—':Math.abs(g.e).toFixed(1))+'</span></td>'
 +'<td class="l">'+(lt==null?'—':'<span class="tm">'+logo(lt)+esc(nm(lt))+'</span>')+'</td>'
 +'<td class="l">'+(g.sig?'<span class="pill '+g.sig+'">'+g.sig+(g.sig=='Pass'?' (28+ line)':'')+'</span>':(g.dd?'':'—'))+(g.sig&&g.dd?'<br>':'')+ddp(g)+'</td><td>'+fat(g)+'</td>'
 +'<td>'+g.t.toFixed(1)+' / '+(g.bt==null?'—':(+g.bt).toFixed(1))+'</td><td>'+as+' '+f1(g.aa)+'<span class="sub">'+hs+' '+f1(g.ha)+'</span></td>'
@@ -664,17 +681,19 @@ $('#rt').innerHTML=r.map(function(t){return'<tr><td>'+t.rk+'</td><td class="l st
 +'<td>'+(t.epa==null?'—':(t.epa>0?'+':'')+t.epa.toFixed(3))+'</td><td>'+(t.pre||'—')+'</td><td>'+sg(t.woe,.5,-.5)+'</td><td>'+(t.to==null?'—':(t.to>0?'+':'')+t.to.toFixed(2))+'</td><td>'+(t.rr==null?'—':Math.round(100*t.rr)+'%')+'</td>'
 +'<td>'+(t.la==null?'—':'<span class="'+(t.la<=-21?'pos':t.la>=21?'neg':'')+'">'+f1(t.la)+'</span>')+'</td><td>'+sg(t.mv,.5,-.5)+'</td><td>'+sg(t.he,.5,-.5)+'</td><td>'+(t.adj?sg(t.adj,0,0):'—')+'</td></tr>'}).join('')||'<tr><td class="empty" colspan="15">No team matches that search.</td></tr>'}
 function record(){var B=function(b){return D.summary.filter(function(r){return r.bucket==b})[0]||{}},rec=function(r){return r.ats_w==null?'—':r.ats_w+'–'+r.ats_l},
-tile=function(k,v,s){return'<div class="tile"><div class="k">'+k+'</div><div class="v">'+v+'</div><div class="k">'+s+'</div></div>'},a=B('all'),e3=B('edge_3'),st=B('strong'),lw=B('last_week_edge_3');
-$('#tiles').innerHTML=tile(M.season+' vs closing line',rec(a),pct(a.ats_pct)+', 52.4% breaks even')+tile('Disagreed with the close by 3+',rec(e3),pct(e3.ats_pct)+' this season')+tile('Strong spots this season',rec(st),pct(st.ats_pct))
-+tile('Average miss on the margin',(+a.mae_model||0).toFixed(2)+' pts','Vegas closing line: '+(+a.mae_vegas||0).toFixed(2)+' pts')+tile('Last 7 days, 3+ edges',rec(lw),pct(lw.ats_pct));
+tile=function(k,v,s){return'<div class="tile"><div class="k">'+k+'</div><div class="v">'+v+'</div><div class="k">'+s+'</div></div>'},a=B('all'),ln=B('lean'),e3=B('edge_3'),lw=B('last_week_lean');
+var pr=function(r){return r.ats_w==null||r.ats_w+r.ats_l==0?'—':pct(r.ats_w/(r.ats_w+r.ats_l))};
+$('#tiles').innerHTML=tile(M.season+' Leans (2+ pts)',rec(ln),pr(ln)+' vs closing lines, 52.4% breaks even')+tile('3+ point edges',rec(e3),pr(e3)+' this season')+tile('Every pick',rec(a),pr(a)+' this season')
++tile('Average miss on the margin',(+a.mae_model||0).toFixed(2)+' pts','Vegas closing line: '+(+a.mae_vegas||0).toFixed(2)+' pts')+tile('Last 7 days, Leans',rec(lw),pr(lw));
 var r3=function(w,l,p){return'<span class="'+(p>=.524?'pos':'')+'">'+pct(p)+' ('+w+'–'+l+')</span>'};
-$('#bt').innerHTML=D.backtest.map(function(b){return'<tr><td class="l"><b>'+esc(b[0])+'</b></td><td>'+b[1]+'</td><td>'+b[2].toFixed(2)+'</td><td>'+b[3].toFixed(2)+'</td><td>'+r3(b[4],b[5],b[4]/(b[4]+b[5]))+'</td><td>'+r3(b[6],b[7],b[6]/(b[6]+b[7]))+'</td><td><b>'+r3(b[8],b[9],b[8]/(b[8]+b[9]))+'</b></td><td>'+pct(b[10]/(b[10]+b[11]))+' ('+b[10]+'–'+b[11]+')</td></tr>'}).join('')}
+var cur=a.ats_w==null?[]:[[M.season+' (to date)',a.games,+a.mae_model,+a.mae_vegas,ln.ats_w,ln.ats_l,e3.ats_w,e3.ats_l,a.ats_w,a.ats_l,null,null]];
+$('#bt').innerHTML=cur.concat(D.backtest).map(function(b){var tot=/total/.test(b[0]);return'<tr'+(tot?' style="font-weight:600"':'')+'><td class="l">'+esc(b[0])+'</td><td>'+b[1]+'</td><td>'+b[2].toFixed(2)+'</td><td>'+b[3].toFixed(2)+'</td><td><b>'+r3(b[4],b[5],b[4]/(b[4]+b[5]))+'</b></td><td>'+r3(b[6],b[7],b[6]/(b[6]+b[7]))+'</td><td>'+r3(b[8],b[9],b[8]/(b[8]+b[9]))+'</td><td>'+(b[10]==null?'—':pct(b[10]/(b[10]+b[11]))+' ('+b[10]+'–'+b[11]+')')+'</td></tr>'}).join('')}
 document.querySelectorAll('nav button').forEach(function(b){b.onclick=function(){document.querySelectorAll('nav button').forEach(function(x){x.setAttribute('aria-selected',x==b)});document.querySelectorAll('main>section').forEach(function(s){s.hidden=s.id!=b.dataset.t})}});
 $('#scope').onchange=function(){S.scope=this.value;board()};$('#sort').onchange=function(){S.sort=this.value;board()};$('#q').oninput=function(){S.q=this.value.trim().toLowerCase();board()};
 $('#fbs').onchange=function(){S.fbs=this.checked;board()};$('#rshow').onchange=function(){S.rshow=this.value;ratings()};$('#rq').oninput=function(){S.rq=this.value.trim().toLowerCase();ratings()};
 $('#wk').textContent=M.week?'Week '+M.week:'';
 $('#stamp').textContent='Model run '+M.run_at+'. Results through '+M.data_through+'. '+(M.n_lines?M.book+' lines for '+M.n_lines+' games, last pulled '+M.lines_at+' (a game keeps its last line from before kickoff).':'No sportsbook lines were available when this page was built.');
-$('#gnote').innerHTML='Book line and edge use the '+esc(M.book||'sportsbook')+' spread pulled when this page was built. <b>Strong</b> = a 3+ point edge where the market just overreacted the other way. <b>Lean</b> = any other 3+ point edge. <b>Pass</b> = a 3+ point edge on a line of 28 or more.'+(M.adj&&M.adj.length?' Team adjustments included: '+M.adj.map(function(a){return esc(a[0])+' '+f1(a[1])+(a[2]?' ('+esc(a[2])+')':'')}).join(', ')+'.':'');
+$('#gnote').innerHTML='Book line and edge use the '+esc(M.book||'sportsbook')+' spread pulled when this page was built. <b>Lean</b> = the model and the line differ by 2+ points.'+(M.adj&&M.adj.length?' Team adjustments included: '+M.adj.map(function(a){return esc(a[0])+' '+f1(a[1])+(a[2]?' ('+esc(a[2])+')':'')}).join(', ')+'.':'');
 var LV=M.live||[],fails=0,tm=null;
 function poll(){clearTimeout(tm);if(!LV.length||fails>=3||!window.fetch||document.hidden)return;
 Promise.all(LV.map(function(s){return fetch('https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?dates='+M.season+'&seasontype='+s[0]+'&week='+s[1]+'&groups=80&limit=400').then(function(r){if(!r.ok)throw r.status;return r.json()})}))
@@ -748,7 +767,7 @@ def main(out_dir, season=None):
     U['this_week'] = U.week == nxt
     U['fbs_both'] = U.home_id.isin(fb.index) & U.away_id.isin(fb.index)
     keep = ['game_id', 'season', 'week', 'season_type', 'date', 'neutral_site', 'home_id', 'home_team', 'away_id', 'away_team',
-            'core', 'f_out', 'f_to', 'f_rush', 'h_ats1', 'a_ats1', 'rx', 'home_edge', 'model_margin', 'model_total', 'home_win_prob', 'this_week', 'fbs_both', 'h_def_rank']
+            'core', 'f_out', 'f_to', 'f_rush', 'h_ats1', 'a_ats1', 'rx', 'home_edge', 'model_margin', 'model_total', 'home_win_prob', 'this_week', 'fbs_both', 'h_def_rank', 'adj']
     U['date'] = U.date.dt.strftime('%Y-%m-%dT%H:%MZ')
     U = U[keep].copy(); U[U.select_dtypes('number').columns] = U.select_dtypes('number').round(3)
     U['game_id'] = U.game_id.astype(str)
@@ -767,22 +786,19 @@ def main(out_dir, season=None):
     wf = walk_forward(gt, pt, at_, he_t, fbs_teams(gt.season.iloc[0]).index if len(g) == 0 else fb.index)
     wf = wf[wf.home_id.isin(fb.index) | wf.away_id.isin(fb.index)].copy()
     wf['fbs_both'] = wf.home_id.isin(fb.index) & wf.away_id.isin(fb.index)
-    wf['edge'] = wf.model_margin + wf.vegas            # >0: model likes home vs the line
+    wf['edge'] = wf.adj.where(wf.vegas.notna())          # >0: model likes home vs the line
+    wf['line_model'] = np.where(wf.vegas.notna(), wf.adj - wf.vegas, wf.model_margin)
     wf['ats_margin'] = wf.margin + wf.vegas            # >0: home covered
     res = np.where(wf.vegas.isna() | (wf.ats_margin == 0) | (wf.edge == 0), 'P',
                    np.where(np.sign(wf.edge) == np.sign(wf.ats_margin), 'W', 'L'))
     wf['model_ats'] = np.where(wf.vegas.isna(), None, res)
-    pk = np.where(wf.edge > 0, wf.h_ats1, wf.a_ats1); op = np.where(wf.edge > 0, wf.a_ats1, wf.h_ats1)
-    wf['react_spot'] = np.fmax(-np.nan_to_num(pk), np.nan_to_num(op))
-    wf['big_spread'] = wf.vegas.abs() >= BIG_SPREAD
-    wf['strong'] = (wf.edge.abs() >= 3) & (wf.react_spot >= STRONG_RS) & ~wf.big_spread
-    wf['su_correct'] = (np.sign(wf.model_margin) == np.sign(wf.margin)).astype(int)
-    wf['abs_err_model'] = (wf.margin - wf.model_margin).abs(); wf['abs_err_vegas'] = (wf.margin + wf.vegas).abs()
+    wf['su_correct'] = (np.sign(wf.line_model) == np.sign(wf.margin)).astype(int)
+    wf['abs_err_model'] = (wf.margin - wf.line_model).abs(); wf['abs_err_vegas'] = (wf.margin + wf.vegas).abs()
 
     # ---- results.json: this season's finished games as the model saw them beforehand (for the page's past-weeks view)
     wf['model_total'] = wf.base_home + wf.base_away
     rc = ['game_id', 'season_type', 'week', 'date', 'neutral_site', 'home_id', 'away_id', 'home_team', 'away_team', 'home_score', 'away_score',
-          'vegas', 'over_under', 'model_total', 'h_def_rank', 'core', 'f_out', 'f_to', 'f_rush', 'rx', 'home_edge', 'h_ats1', 'a_ats1', 'fbs_both']
+          'vegas', 'over_under', 'model_total', 'h_def_rank', 'adj', 'core', 'f_out', 'f_to', 'f_rush', 'rx', 'home_edge', 'h_ats1', 'a_ats1', 'fbs_both']
     rs = wf[rc].copy() if len(g) else pd.DataFrame(columns=rc)
     if len(rs):
         rs['date'] = rs.date.dt.strftime('%Y-%m-%dT%H:%MZ'); rs['game_id'] = rs.game_id.astype(str)
@@ -798,17 +814,14 @@ def main(out_dir, season=None):
                     ats_pct=round((dd.model_ats == 'W').mean(), 3) if len(dd) else None,
                     mae_model=round(d.abs_err_model.mean(), 2) if len(d) else None, mae_vegas=round(d.abs_err_vegas.mean(), 2) if len(d) else None,
                     su_pct=round(d.su_correct.mean(), 3) if len(d) else None)
-    S.append(summ('all', v))
-    for th in [3, 5, 7]: S.append(summ(f'edge_{th}', v[(v.edge.abs() >= th) & ~v.big_spread]))
-    S.append(summ('strong', v[v.strong]))
+    S.append(summ('all', v)); S.append(summ('lean', v[v.edge.abs() >= LEAN])); S.append(summ('edge_3', v[v.edge.abs() >= 3]))
     lw = v[v.date >= v.date.max() - pd.Timedelta(days=6)]
-    S.append(summ('last_week', lw)); S.append(summ('last_week_edge_3', lw[(lw.edge.abs() >= 3) & ~lw.big_spread]))
+    S.append(summ('last_week', lw)); S.append(summ('last_week_lean', lw[lw.edge.abs() >= LEAN]))
     s = pd.DataFrame(S)
     s['season'] = int(gt.season.iloc[0]) if len(gt) else Y
     s['data_through'] = gt.date.max().strftime('%Y-%m-%d'); s['run_at'] = now.strftime('%Y-%m-%d %H:%M UTC')
     s['next_week'] = None if nxt is None or pd.isna(nxt) else int(nxt)
-    for k, val in W.items(): s[k] = val
-    s['hfa'] = P['H']; s['sigma'] = P['sigma']; s['react_dz'] = REACT_DZ; s['strong_rs'] = STRONG_RS; s['big_spread'] = BIG_SPREAD
+    s['hfa'] = P['H']; s['sigma'] = P['sigma']; s['lean'] = LEAN
     s['home_edge_sd'] = round(float(he.reindex(fb.index).std()), 2)
     dump('summary.json', s)
     if os.environ.get('CFB_FAN') and len(U):
